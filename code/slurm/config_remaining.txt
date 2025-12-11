@@ -1,0 +1,1 @@
+60 6 barlow wideresnet 128 barlow_wideresnet_v1

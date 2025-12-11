@@ -1,0 +1,3 @@
+12 1 empssl wideresnet 12 empssl_wideresnet_v1
+4 1 empssl convnextv2_tiny 12 empssl_convnextv2_tiny_v1
+30 3 barlow convnextv2_tiny 128 barlow_convnextv2_tiny_v1

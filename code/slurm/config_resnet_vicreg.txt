@@ -1,0 +1,1 @@
+250 10 0 resnet_vicreg_birds birds

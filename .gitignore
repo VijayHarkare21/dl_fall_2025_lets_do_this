@@ -1,0 +1,21 @@
+# --- model weights ---
+*.pth
+*.pt
+
+# --- datasets ---
+pretrain_data/
+test_sets/
+
+# --- cache / logs / junk ---
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.ipynb_checkpoints/
+.cache/
+slurm_logs/
+fiftyone_zoo/
+hf_cache/
+**/wandb/
+/outputs/
+
+ssl_env/

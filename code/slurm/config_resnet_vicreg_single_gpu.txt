@@ -1,0 +1,3 @@
+125 10 0 resnet_vicreg_birds_1_gpu birds
+125 10 100000 resnet_vicreg_scenes_1_gpu scenes
+125 10 100000 resnet_vicreg_general_1_gpu general
