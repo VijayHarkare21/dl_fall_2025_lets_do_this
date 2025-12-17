@@ -1,0 +1,998 @@
+import argparse
+import os
+import sys
+from pathlib import Path
+from typing import Dict, Any, Optional, List, Tuple
+import json
+import copy
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import pandas as pd
+import numpy as np
+from tqdm import tqdm
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.svm import LinearSVC
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+import resnet
+
+# Add project root to path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+from timm import create_model
+
+def exclude_bias_and_norm(p):
+    return p.ndim == 1
+
+def exclude_from_wd_and_lars(param):
+    """Return True to SKIP weight decay and LARS adaptation."""
+    return True
+
+def include_in_wd_and_lars(param):
+    """Return False to APPLY weight decay and LARS adaptation."""
+    return False
+
+# =============================================================================
+#                          DATASET CLASSES
+# =============================================================================
+
+import torchvision.transforms as T
+
+def process_tta_crops(crops):
+    """
+    Standalone function to process TTA crops.
+    Replaces the unpicklable lambda function.
+    """
+    # Define normalization constants (same as in your original code)
+    mean = [0.485, 0.456, 0.406]
+    std = [0.229, 0.224, 0.225]
+    
+    # Re-instantiate transforms here so the worker process has them
+    normalize = T.Normalize(mean=mean, std=std)
+    to_tensor = T.ToTensor()
+    
+    # Stack and normalize
+    return torch.stack([
+        normalize(to_tensor(crop)) for crop in crops
+    ])
+
+class EvalImageDataset(Dataset):
+    def __init__(
+        self,
+        image_dir: str,
+        image_list: List[str],
+        labels: Optional[List[int]] = None,
+        crop_size: int = 96,
+        use_tta: bool = False
+    ):
+        self.image_dir = Path(image_dir)
+        self.image_list = image_list
+        self.labels = labels
+        self.use_tta = use_tta
+        self.crop_size = crop_size
+        
+        # Standard Normalization
+        mean = [0.485, 0.456, 0.406]
+        std = [0.229, 0.224, 0.225]
+        normalize = T.Normalize(mean=mean, std=std)
+        
+        # Base resize: We need the image to be larger than the crop_size for TenCrop to work.
+        # Standard practice is resize_dim = crop_size / 0.875 (e.g., 224 -> 256)
+        resize_dim = int(crop_size / 0.875)
+
+        if self.use_tta:
+            # --- 10-CROP TTA ---
+            self.transform = T.Compose([
+                T.Resize(resize_dim),
+                T.TenCrop(crop_size), # Returns tuple of 10 PIL images
+                T.Lambda(process_tta_crops) # Stacks into (10, 3, H, W)
+            ])
+            # self.transform = T.Compose([
+            #     T.Resize(resize_dim),
+            #     T.CenterCrop(crop_size),
+            #     T.ToTensor(),
+            #     normalize
+            # ])
+        else:
+            # --- SINGLE VIEW (Validation Standard) ---
+            self.transform = T.Compose([
+                T.Resize(resize_dim),
+                T.CenterCrop(crop_size),
+                T.ToTensor(),
+                normalize
+            ])
+
+    def __len__(self):
+        return len(self.image_list)
+    
+    def __getitem__(self, idx):
+        img_name = self.image_list[idx]
+        img_path = self.image_dir / img_name
+        
+        # Load PIL
+        image = Image.open(img_path).convert('RGB')
+        
+        # Apply Transform (Returns Tensor)
+        # If TTA: (10, 3, H, W)
+        # If Not: (3, H, W)
+        image_tensor = self.transform(image)
+        
+        if self.labels is not None:
+            return image_tensor, self.labels[idx], img_name
+        return image_tensor, img_name
+
+def collate_fn_labeled(batch):
+    images = torch.stack([item[0] for item in batch]) # If TTA: (B, 6, C, H, W)
+    labels = [item[1] for item in batch]
+    filenames = [item[2] for item in batch]
+    return images, labels, filenames
+
+def collate_fn_unlabeled(batch):
+    images = torch.stack([item[0] for item in batch])
+    filenames = [item[1] for item in batch]
+    return images, filenames
+
+# =============================================================================
+#                          FEATURE EXTRACTION
+# =============================================================================
+
+def _concat_backbone_features(images_flat, backbones, device):
+    """
+    Run all backbones on the same flattened batch and concatenate
+    their (L2-normalized) features. If on CUDA and multiple backbones are
+    provided, run them concurrently using separate CUDA streams.
+    """
+    # Ensure list
+    if not isinstance(backbones, (list, tuple)):
+        backbones = [backbones]
+
+    feats_list = [None] * len(backbones)
+
+    use_cuda_streams = (
+        device.startswith("cuda")
+        and torch.cuda.is_available()
+        and len(backbones) > 1
+    )
+
+    if use_cuda_streams:
+        streams = [torch.cuda.Stream(device=device) for _ in backbones]
+        with torch.no_grad():
+            for i, (backbone, stream) in enumerate(zip(backbones, streams)):
+                with torch.cuda.stream(stream):
+                    f = backbone(images_flat)      # (N, D_i)
+                    f = F.normalize(f, p=2.0, dim=1)
+                    feats_list[i] = f
+            # Wait for all streams to finish
+            torch.cuda.synchronize()
+    else:
+        with torch.no_grad():
+            for i, backbone in enumerate(backbones):
+                f = backbone(images_flat)          # (N, D_i)
+                f = F.normalize(f, p=2.0, dim=1)
+                feats_list[i] = f
+
+    # Concatenate features from all backbones: (N, sum_i D_i)
+    features = torch.cat(feats_list, dim=1)
+    features = F.normalize(features, p=2.0, dim=1)
+    return features
+
+
+def extract_features_multi_view(images, backbones, device):
+    """
+    Handle both single-view (B, C, H, W) and multi-view (B, V, C, H, W) inputs.
+    Supports ensembling multiple backbones by concatenating their features.
+    Uses concurrent execution for ensembles on CUDA if possible.
+    """
+    images = images.to(device, non_blocking=True)
+
+    # Multi-view case: (B, V, C, H, W) -> flatten to (B*V, C, H, W)
+    if images.dim() == 5:
+        B, V, C, H, W = images.shape
+        images_flat = images.view(B * V, C, H, W)
+
+        features_flat = _concat_backbone_features(images_flat, backbones, device)  # (B*V, D_total)
+
+        # Reshape back to (B, V, D_total), average views, and re-normalize
+        features = features_flat.view(B, V, -1).mean(dim=1)  # (B, D_total)
+        features = F.normalize(features, p=2.0, dim=1)
+    else:
+        # Single-view: (B, C, H, W)
+        images_flat = images
+        features = _concat_backbone_features(images_flat, backbones, device)       # (B, D_total)
+
+    return features.cpu().numpy()
+
+
+def extract_features_from_dataloader(
+    backbones, device,
+    dataloader: DataLoader,
+    split_name: str = 'train',
+    has_labels: bool = True,
+) -> Tuple[np.ndarray, Optional[List[int]], List[str]]:
+    
+    all_features = []
+    all_labels = []
+    all_filenames = []
+    
+    print(f"\nExtracting features from {split_name} set (TTA Enabled)...")
+    
+    for batch in tqdm(dataloader, desc=f"{split_name} features"):
+        if has_labels:
+            images, labels, filenames = batch
+            all_labels.extend(labels)
+        else:
+            images, filenames = batch
+        
+        # Use the multi-view extraction logic (handles single or multiple backbones)
+        with torch.no_grad():
+            features = extract_features_multi_view(images, backbones, device)
+        all_features.append(features)
+        all_filenames.extend(filenames)
+    
+    features = np.concatenate(all_features, axis=0)
+    labels = all_labels if all_labels else None
+    
+    return features, labels, all_filenames
+
+
+# =============================================================================
+#                          AdaNPC ADAPTATION
+# =============================================================================
+
+def adanpc_refinement(
+    train_feats: np.ndarray,
+    train_labels: List[int],
+    test_feats: np.ndarray,
+    k: int = 50,
+    threshold: float = 0.9, # Confidence threshold
+    dataset_name: str = "dataset"
+) -> np.ndarray:
+    """
+    AdaNPC-style refinement, faithful to the paper:
+
+    Memory bank M is initialized with all source (train+val) features and labels.
+    Then each test feature x_u is processed ONLINE and ONE-BY-ONE:
+
+      1. Compute cosine similarity between x_u and all items in M.
+      2. Find the k nearest neighbors B_k(x_u) in M.
+      3. Compute class scores by summing neighbor cosine similarities per class.
+      4. Turn scores into probabilities via softmax (η_k(x_u)).
+      5. Predict y_hat = argmax_c η_k(x_u)[c].
+      6. If max_c η_k(x_u)[c] > threshold, append (x_u, y_hat) to M.
+
+    This matches Eq.(5) and the online memory augmentation rule described in the
+    main text: test-time adaptation via memory augmentation with confident targets.
+    """
+    print(f"\n{'='*40}")
+    print(f"Running AdaNPC Adaptation for {dataset_name}")
+    print(f"Initial Memory Size: {len(train_labels)}")
+    print(f"Threshold: {threshold}")
+    print(f"{'='*40}")
+
+    # Ensure numpy arrays with consistent dtypes
+    memory_feats = np.asarray(train_feats, dtype=np.float32).copy()  # (N_s, D)
+    memory_labels = np.asarray(train_labels, dtype=np.int64).copy()   # (N_s,)
+    test_feats = np.asarray(test_feats, dtype=np.float32)             # (N_t, D)
+
+    num_test = test_feats.shape[0]
+    assert memory_feats.shape[0] == memory_labels.shape[0], "Memory feats/labels size mismatch in AdaNPC."
+
+    if memory_feats.shape[0] == 0:
+        raise ValueError("AdaNPC memory bank is empty. Train features must be non-empty.")
+
+    final_preds: List[int] = []
+    num_confident_added = 0
+
+    # Process each test sample one-by-one (online adaptation)
+    for idx in range(num_test):
+        feat_u = test_feats[idx]  # (D,)
+
+        # Cosine similarity because features are L2-normalized: w_uj = h(x_u)^T h(x_j)
+        sims = memory_feats @ feat_u  # (N_mem,)
+
+        # Effective k cannot exceed current memory size
+        k_eff = min(k, memory_feats.shape[0])
+        if k_eff <= 0:
+            raise ValueError("AdaNPC: effective k <= 0, something is wrong.")
+
+        # Indices of top-k similarities (neighbors)
+        if k_eff == memory_feats.shape[0]:
+            # All memory points are neighbors
+            neighbor_idx = np.argsort(-sims)
+        else:
+            # argpartition for efficiency, order of neighbors does not matter for sum
+            neighbor_idx = np.argpartition(-sims, k_eff - 1)[:k_eff]
+
+        neighbor_labels = memory_labels[neighbor_idx]   # (k_eff,)
+        neighbor_weights = sims[neighbor_idx]           # (k_eff,)
+
+        # Aggregate weights per class: s_c = sum_{j in B_k, y_j=c} w_uj
+        max_label = int(memory_labels.max())  # assume integer labels
+        class_scores = np.zeros(max_label + 1, dtype=np.float32)
+        np.add.at(class_scores, neighbor_labels, neighbor_weights)
+
+        # Softmax over class_scores -> η_k(x_u)
+        max_score = float(class_scores.max())
+        # numerical stability
+        exp_scores = np.exp(class_scores - max_score)
+        prob_vec = exp_scores / exp_scores.sum()
+
+        pred_label = int(prob_vec.argmax())
+        pred_conf = float(prob_vec[pred_label])
+
+        final_preds.append(pred_label)
+
+        # Memory augmentation if prediction is confident enough
+        if pred_conf > threshold:
+            memory_feats = np.vstack([memory_feats, feat_u[None, :]])
+            memory_labels = np.concatenate(
+                [memory_labels, np.asarray([pred_label], dtype=memory_labels.dtype)]
+            )
+            num_confident_added += 1
+
+    print(f"  Total test samples: {num_test}")
+    print(f"  Confident samples added to memory: {num_confident_added} "
+          f"({(num_confident_added / max(1, num_test)) * 100:.1f}%)")
+    print(f"  Final Memory Size: {len(memory_labels)}")
+
+    return np.asarray(final_preds, dtype=np.int64)
+
+# =============================================================================
+#                          MODEL & UTILS
+# =============================================================================
+
+class LayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError 
+        self.normalized_shape = (normalized_shape, )
+    
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return torch.nn.functional.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
+
+from torchvision.models.vision_transformer import VisionTransformer
+
+class SmallVisionTransformer(nn.Module):
+    """
+    Small Vision Transformer encoder (optimized for <100M params)
+    
+    Default config (~22M params):
+    - hidden_dim: 384
+    - num_layers: 8
+    - num_heads: 6
+    - mlp_dim: 1536
+    """
+    def __init__(
+        self,
+        image_size=96,
+        patch_size=8,
+        hidden_dim=384,
+        num_layers=8,
+        num_heads=6,
+        mlp_dim=1536,
+    ):
+        super().__init__()
+
+        self.vit = VisionTransformer(
+            image_size=image_size,
+            patch_size=patch_size,
+            hidden_dim=hidden_dim,
+            num_layers=num_layers,
+            num_heads=num_heads,
+            mlp_dim=mlp_dim,
+            dropout=0.0,
+            attention_dropout=0.0,
+            num_classes=hidden_dim,
+        )
+
+        # Replace classifier head with identity
+        self.vit.head = nn.Identity()
+        
+        self._init_weights()
+        self.embed_dim = hidden_dim
+
+    def _init_weights(self):
+        """Xavier initialization for better training"""
+        for m in self.vit.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.LayerNorm, nn.BatchNorm1d, nn.BatchNorm2d)):
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        return self.vit(x)  # [B, hidden_dim]
+
+def build_backbone(config: Dict[str, Any], device: str) -> nn.Module:
+    backbone_name = config.get('backbone', 'convnextv2_tiny')
+    if backbone_name == 'convnextv2_tiny':
+        backbone = create_model('convnextv2_tiny', pretrained=False, num_classes=0)
+        backbone.stem = nn.Sequential(
+            nn.Conv2d(3, 96, kernel_size=3, stride=2, padding=1),
+            LayerNorm(96, eps=1e-6, data_format="channels_first")
+        )
+    elif backbone_name == 'wideresnet':
+        backbone = create_model('wide_resnet50_2', pretrained=False, num_classes=0)
+    elif backbone_name == 'vit':
+        backbone = SmallVisionTransformer()
+    elif backbone_name == 'resnet50':
+        backbone, _ = resnet.__dict__[backbone_name](
+            zero_init_residual=True
+        )
+    else:
+        raise ValueError(f"Unknown backbone: {backbone_name}")
+    
+    backbone = backbone.to(device)
+    backbone.eval()
+    return backbone
+
+def load_model_weights(
+    backbone: nn.Module,
+    checkpoint: Dict[str, Any],
+    backbone_name: str,
+) -> None:
+    """Load model weights from checkpoint."""
+    print("\nLoading model weights...")
+    
+    # Try different key names for backbone weights
+    backbone_keys = ['model', 'model_state', 'model_state_dict', 'backbone', 'backbone_state_dict']
+    loaded_backbone = False
+
+    if backbone_name == "resnet50" and "model" in checkpoint:
+        checkpoint = checkpoint["model"]
+        checkpoint = {
+            key.replace("module.backbone.", ""): value
+            for (key, value) in checkpoint.items()
+        }
+    
+    for key in backbone_keys:
+        if key in checkpoint:
+            state_dict = checkpoint.get(key, checkpoint)
+            if backbone_name == 'vit':
+                new_state_dict = {}
+                for key1, value in state_dict.items():
+                    if key1.startswith('encoder_q.'):
+                        new_key = key1[10:] 
+                        new_state_dict[new_key] = value
+                backbone.load_state_dict(new_state_dict)
+            else:
+                backbone.load_state_dict(state_dict)
+            print(f"  Backbone weights loaded (from '{key}')")
+            loaded_backbone = True
+            break
+    
+    if not loaded_backbone:
+        print("  WARNING: No backbone weights found in checkpoint!")
+        print(f"  Available keys: {list(checkpoint.keys())}")
+        
+    # Set to eval mode and freeze
+    backbone.eval()
+    for param in backbone.parameters():
+        param.requires_grad = False
+    
+    print("All backbone weights frozen.")
+
+# =============================================================================
+#                          EVALUATION LOGIC
+# =============================================================================
+
+# def train_linear_probe_with_search(
+#     train_features: np.ndarray,
+#     train_labels: List[int],
+#     val_features: np.ndarray,
+#     val_labels: List[int],
+#     device: str,
+#     lrs: List[float],
+#     wds: List[float],
+#     epochs: int,
+#     batch_size: int = 2048,
+# ):
+#     """
+#     Train a linear probe (nn.Linear + softmax) on frozen features.
+#     Do a small grid search over (lr, weight_decay) and select the best
+#     based on validation accuracy. Returns:
+#       - best_model (nn.Module)
+#       - best_val_acc (float)
+#       - best_hparams (dict)
+#     """
+#     train_labels = np.asarray(train_labels, dtype=np.int64)
+#     val_labels = np.asarray(val_labels, dtype=np.int64)
+
+#     X_train = torch.from_numpy(train_features).to(device)
+#     y_train = torch.from_numpy(train_labels).to(device)
+#     X_val = torch.from_numpy(val_features).to(device)
+#     y_val = torch.from_numpy(val_labels).to(device)
+
+#     num_classes = int(max(train_labels.max(), val_labels.max())) + 1
+#     feat_dim = train_features.shape[1]
+
+#     best_acc = -1.0
+#     best_state = None
+#     best_hparams = None
+
+#     print("\n" + "=" * 60)
+#     print("Linear Probe Hyperparameter Search")
+#     print("=" * 60)
+#     print(f"  num_classes: {num_classes}")
+#     print(f"  feat_dim:    {feat_dim}")
+#     print(f"  lrs:         {lrs}")
+#     print(f"  wds:         {wds}")
+#     print(f"  epochs:      {epochs}")
+#     print(f"  batch_size:  {batch_size}")
+
+#     for lr in lrs:
+#         for wd in wds:
+#             probe = nn.Linear(feat_dim, num_classes).to(device)
+#             # optimizer = torch.optim.SGD(
+#             #     probe.parameters(), lr=lr,
+#             #     momentum=0.9, weight_decay=0
+#             # )
+#             optimizer = torch.optim.Adam(probe.parameters(), lr=lr, weight_decay=wd, betas=(0.9,0.995))
+#             criterion = nn.CrossEntropyLoss()
+
+#             for ep in range(epochs):
+#                 probe.train()
+#                 perm = torch.randperm(X_train.size(0), device=device)
+#                 for i in range(0, X_train.size(0), batch_size):
+#                     idx = perm[i:i + batch_size]
+#                     xb = X_train[idx]
+#                     yb = y_train[idx]
+
+#                     optimizer.zero_grad()
+#                     logits = probe(xb)
+#                     loss = criterion(logits, yb)
+#                     loss.backward()
+#                     optimizer.step()
+
+#             # Validation
+#             probe.eval()
+#             with torch.no_grad():
+#                 logits_val = probe(X_val)
+#                 preds_val = logits_val.argmax(dim=1)
+#                 acc = (preds_val == y_val).float().mean().item()
+
+#             print(f"[LinearProbe] lr={lr:.3g}, wd={wd:.1e} => "
+#                   f"val acc: {acc*100:.2f}%")
+
+#             if acc > best_acc:
+#                 best_acc = acc
+#                 best_state = copy.deepcopy(probe.state_dict())
+#                 best_hparams = {'lr': lr, 'weight_decay': wd}
+
+#     # Retrain on train+val with best hyperparams
+#     print("\nRetraining linear probe on train+val with best hyperparams...")
+#     X_full = torch.from_numpy(
+#         np.concatenate([train_features, val_features], axis=0)
+#     ).to(device)
+#     y_full = torch.from_numpy(
+#         np.concatenate([train_labels, val_labels], axis=0)
+#     ).to(device)
+
+#     probe = nn.Linear(feat_dim, num_classes).to(device)
+#     optimizer = torch.optim.SGD(
+#         probe.parameters(),
+#         lr=best_hparams['lr'],
+#         momentum=0.9,
+#         weight_decay=best_hparams['weight_decay']
+#     )
+#     criterion = nn.CrossEntropyLoss()
+
+#     for ep in range(epochs):
+#         probe.train()
+#         perm = torch.randperm(X_full.size(0), device=device)
+#         for i in range(0, X_full.size(0), batch_size):
+#             idx = perm[i:i + batch_size]
+#             xb = X_full[idx]
+#             yb = y_full[idx]
+
+#             optimizer.zero_grad()
+#             logits = probe(xb)
+#             loss = criterion(logits, yb)
+#             loss.backward()
+#             optimizer.step()
+
+#     probe.eval()
+#     print(f"Best val acc from search: {best_acc*100:.2f}%")
+#     print(f"Best hyperparams: {best_hparams}")
+
+#     return probe, best_acc, best_hparams
+
+def train_sklearn_probe(
+    train_features: np.ndarray,
+    train_labels: List[int],
+    val_features: np.ndarray,
+    val_labels: List[int],
+    probe_type: str = "logreg",  # "logreg" or "svm"
+    Cs: List[float] = (0.1, 1.0, 10.0),
+    max_iter: int = 1000,
+):
+    """
+    Train a linear probe using sklearn:
+      - Multinomial Logistic Regression (L2 / lbfgs), or
+      - Linear SVM (L2 / hinge).
+
+    We do a small grid search over C (inverse regularization strength)
+    based on validation accuracy, then refit the best model on train+val.
+    """
+    train_labels = np.asarray(train_labels, dtype=np.int64)
+    val_labels = np.asarray(val_labels, dtype=np.int64)
+
+    best_acc = -1.0
+    best_C = None
+    best_model = None
+
+    print("\n" + "=" * 60)
+    print("Sklearn Linear Probe Hyperparameter Search")
+    print("=" * 60)
+    print(f"  probe_type: {probe_type}")
+    print(f"  Cs:         {list(Cs)}")
+    print(f"  max_iter:   {max_iter}")
+
+    for C in Cs:
+        if probe_type == "logreg":
+            clf = LogisticRegression(
+                penalty="l2",
+                C=C,
+                solver="lbfgs",
+                multi_class="multinomial",
+                max_iter=max_iter,
+                n_jobs=-1,
+            )
+        elif probe_type == "svm":
+            clf = LinearSVC(
+                C=C,
+                loss="hinge",
+                penalty="l2",
+                dual=True,
+                max_iter=max_iter,
+            )
+        else:
+            raise ValueError(f"Unknown probe_type: {probe_type}")
+
+        clf.fit(train_features, train_labels)
+        val_pred = clf.predict(val_features)
+        acc = (val_pred == val_labels).mean()
+
+        print(f"[{probe_type}] C={C:.3g} => val acc: {acc*100:.2f}%")
+
+        if acc > best_acc:
+            best_acc = acc
+            best_C = C
+            best_model = clf
+
+    # Refit on train+val with the best C
+    print("\nRetraining linear probe on train+val with best hyperparams...")
+    X_full = np.concatenate([train_features, val_features], axis=0)
+    y_full = np.concatenate([train_labels, val_labels], axis=0)
+
+    if probe_type == "logreg":
+        final_clf = LogisticRegression(
+            penalty="l2",
+            C=best_C,
+            solver="lbfgs",
+            multi_class="multinomial",
+            max_iter=max_iter,
+            n_jobs=-1,
+        )
+    elif probe_type == "svm":
+        final_clf = LinearSVC(
+            C=best_C,
+            loss="hinge",
+            penalty="l2",
+            dual=True,
+            max_iter=max_iter,
+        )
+    else:
+        raise ValueError(f"Unknown probe_type: {probe_type}")
+    final_clf.fit(X_full, y_full)
+
+    print(f"Best val acc from search: {best_acc*100:.2f}%")
+    print(f"Best hyperparams: {{'C': {best_C}, 'probe_type': '{probe_type}'}}")
+
+    best_hparams = {"C": best_C, "probe_type": probe_type}
+    return final_clf, best_acc, best_hparams
+
+
+
+def evaluate_dataset(
+    backbones, device,
+    data_dir: str,
+    dataset_name: str,
+    k_values: List[int],
+    batch_size: int,
+    num_workers: int,
+    crop_size: int,
+    output_csv: Optional[str] = None,
+    adanpc_threshold: float = 0.9,
+    lp_type: str = "logreg",
+    lp_Cs: Optional[List[float]] = None,
+    lp_max_iter: int = 1000,
+) -> Dict[str, Any]:
+
+    if lp_Cs is None:
+        lp_Cs = [0.1, 1.0, 10.0]
+
+    
+    data_dir = Path(data_dir)
+    print(f"\nProcessing {dataset_name} with TTA + Ensemble + AdaNPC...")
+    
+    # Load Lists
+    train_df = pd.read_csv(data_dir / 'train_labels.csv')
+    val_df = pd.read_csv(data_dir / 'val_labels.csv')
+    test_csv = data_dir / 'test_images.csv'
+    has_test = test_csv.exists()
+    
+    if has_test:
+        test_df = pd.read_csv(test_csv)
+    
+    # --- DATASETS WITH TTA ENABLED ---
+    # We use TTA=True for all splits to get robust features
+    train_dataset = EvalImageDataset(
+        data_dir / 'train', train_df['filename'].tolist(), train_df['class_id'].tolist(), crop_size, use_tta=True
+    )
+    val_dataset = EvalImageDataset(
+        data_dir / 'val', val_df['filename'].tolist(), val_df['class_id'].tolist(), crop_size, use_tta=True
+    )
+    
+    # Note: TTA increases memory usage, so we might need smaller batch size if GPU OOM
+    # If 10 views, effective batch size is batch_size * 10.
+    eff_batch_size = max(1, batch_size // 10)
+    
+    train_loader = DataLoader(train_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn_labeled)
+    val_loader = DataLoader(val_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn_labeled)
+
+    # --- FEATURE EXTRACTION (Multi-View TTA) ---
+    print("Extracting features")
+    tr_f, tr_l, _ = extract_features_from_dataloader(backbones, device, train_loader, 'train')
+    val_f, val_l, _ = extract_features_from_dataloader(backbones, device, val_loader, 'val')
+
+    train_features = tr_f
+    val_features = val_f
+    
+    # Normalize the combined feature
+    train_features = train_features / np.linalg.norm(train_features, axis=1, keepdims=True)
+    val_features = val_features / np.linalg.norm(val_features, axis=1, keepdims=True)
+    
+    train_labels = tr_l
+    val_labels = val_l
+
+    print(f"\n{'='*60}")
+    print("Linear Probe Evaluation")
+    print('='*60)
+    print(f"  Train samples: {len(train_labels)}")
+    print(f"  Val samples:   {len(val_labels)}")
+    print(f"  Feature dim:   {train_features.shape[1]}")
+
+    # ---- Train + tune linear probe on frozen features ----
+    # probe, best_val_acc, best_hparams = train_linear_probe_with_search(
+    #     train_features=train_features,
+    #     train_labels=train_labels,
+    #     val_features=val_features,
+    #     val_labels=val_labels,
+    #     device=device,
+    #     lrs=[5e-5],
+    #     wds=[0],
+    #     epochs=30000,
+    #     batch_size=1024,
+    # )
+    # ---- Train + tune linear probe on frozen features (sklearn) ----
+    probe, best_val_acc, best_hparams = train_sklearn_probe(
+        train_features=train_features,
+        train_labels=train_labels,
+        val_features=val_features,
+        val_labels=val_labels,
+        probe_type=lp_type,
+        Cs=lp_Cs,
+        max_iter=lp_max_iter,
+    )
+
+    results = {
+        'linear_probe_best_val_accuracy': best_val_acc,
+        'linear_probe_best_hparams': best_hparams,
+    }
+
+    print("-" * 35)
+    print(f"Best linear probe val accuracy: {best_val_acc*100:.2f}%")
+    print(f"Best hyperparams: {best_hparams}")
+
+    print(f"\n{'='*60}")
+    print(f"Generating Submission: {dataset_name}")
+    print('='*60)
+    
+    # Generate predictions
+    print("Generating predictions on test set...")
+
+
+    # --- TEST PREDICTION + AdaNPC ---
+    if has_test and output_csv:
+        test_dataset = EvalImageDataset(
+            data_dir / 'test', test_df['filename'].tolist(), None, crop_size, use_tta=True
+        )
+        test_loader = DataLoader(
+            test_dataset, batch_size=eff_batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn_unlabeled
+        )
+        
+        # Extract Test Features
+        test_f, _, test_filenames = extract_features_from_dataloader(
+            backbones, device, test_loader, 'test', has_labels=False
+        )
+        
+        test_features = test_f
+        test_features = test_features / np.linalg.norm(test_features, axis=1, keepdims=True)
+        
+        # ---- Linear probe prediction on test ----
+        # X_test = torch.from_numpy(test_features).to(device)
+        # with torch.no_grad():
+        #     logits_test = probe(X_test)
+        #     final_predictions = logits_test.argmax(dim=1).cpu().numpy().astype(int)
+        # ---- Linear probe prediction on test (sklearn) ----
+        final_predictions = probe.predict(test_features).astype(int)
+        
+        # Save Submission
+        submission_df = pd.DataFrame({
+            'id': test_filenames,
+            'class_id': final_predictions
+        })
+
+        submission_df.to_csv(output_csv, index=False)
+        print(f"Submission saved to {output_csv}")
+        results['submission_path'] = output_csv
+
+        print(f"\nSubmission file created: {output_csv}")
+        print(f"Total predictions: {len(submission_df)}")
+        print(f"\nClass distribution in predictions:")
+        print(submission_df['class_id'].value_counts().head(10))
+        
+        # Validate submission format
+        print(f"\nValidating submission format...")
+        assert list(submission_df.columns) == ['id', 'class_id'], "Invalid columns!"
+        assert submission_df['class_id'].min() >= 0, "Invalid class_id < 0"
+        assert submission_df.isnull().sum().sum() == 0, "Missing values found!"
+        print("✓ Submission format is valid!")
+
+    return results
+
+# =============================================================================
+#                          MAIN
+# =============================================================================
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="TTA Evaluation Script")
+    # parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        nargs='+',
+        required=True,
+        help='One or more checkpoints to ensemble; features will be concatenated.'
+    )
+
+    parser.add_argument('--data_dir', type=str, default=None)
+    parser.add_argument('--dataset_name', type=str, default='dataset')
+    
+    # Dataset specific args
+    parser.add_argument('--cub200_dir', type=str, default=None)
+    parser.add_argument('--miniimagenet_dir', type=str, default=None)
+    parser.add_argument('--sun397_dir', type=str, default=None)
+
+    parser.add_argument('--backbone', type=str, nargs='+', required=True, choices=['resnet50', 'vit', 'wideresnet', 'convnextv2_tiny'])
+    parser.add_argument('--img_size', type=int, default=96)
+    parser.add_argument('--k_values', type=int, nargs='+', default=[1, 3, 5, 10, 20, 50, 100, 200])
+    parser.add_argument('--batch_size', type=int, default=512)
+    parser.add_argument('--output_dir', type=str, default='./submissions')
+    parser.add_argument('--output_csv', type=str, default=None)
+    parser.add_argument('--adanpc_thresh', type=float, default=0.9, help="Threshold for AdaNPC memory expansion")
+    
+    # parser.add_argument('--lp_lrs', type=float, nargs='+',
+    #                     default=[0.1, 0.01, 0.001],
+    #                     help='Learning rates to try for linear probe.')
+    # parser.add_argument('--lp_wds', type=float, nargs='+',
+    #                     default=[1e-4, 1e-5],
+    #                     help='Weight decays to try for linear probe.')
+    # parser.add_argument('--lp_epochs', type=int, default=10,
+    #                     help='Training epochs per hyperparam setting for linear probe.')
+    # parser.add_argument('--lp_batch_size', type=int, default=512,
+    #                     help='Batch size for linear probe training.')
+
+    parser.add_argument('--lp_type', type=str,
+                        default='logreg',
+                        choices=['logreg', 'svm'],
+                        help='Type of linear probe: multinomial logistic regression or linear SVM (hinge).')
+    parser.add_argument('--lp_Cs', type=float, nargs='+',
+                        default=[10.0],
+                        help='List of C values (inverse regularization strength) to try for the linear probe.')
+    parser.add_argument('--lp_max_iter', type=int, default=10000,
+                        help='Max iterations for sklearn linear probe solver.')
+
+
+    return parser.parse_args()
+
+def print_model_summary(backbone: nn.Module) -> None:
+    """Print model parameter summary (supports single or multiple backbones)."""
+    print("\n" + "=" * 60)
+    print("Model Summary (Frozen for Evaluation)")
+    print("=" * 60)
+
+    if isinstance(backbone, (list, tuple)):
+        backbones = backbone
+    else:
+        backbones = [backbone]
+
+    total_params = 0
+    total_trainable = 0
+
+    for idx, b in enumerate(backbones):
+        backbone_params = sum(p.numel() for p in b.parameters())
+        backbone_trainable = sum(p.numel() for p in b.parameters() if p.requires_grad)
+        print(f"Backbone[{idx}]: {backbone_params:,} params ({backbone_trainable:,} trainable)")
+        total_params += backbone_params
+        total_trainable += backbone_trainable
+
+    print(f"Total (all backbones): {total_params:,} params ({total_trainable:,} trainable)")
+    print("=" * 60)
+
+def main():
+    args = parse_args()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Load one backbone per checkpoint (features will be concatenated)
+    backbones = []
+    for ckpt_path, backbone_name in zip(args.checkpoint, args.backbone):
+        print(f"\nLoading checkpoint: {ckpt_path}")
+        c = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+        b = build_backbone({'backbone': backbone_name}, device)
+        load_model_weights(b, c, backbone_name)
+        backbones.append(b)
+
+    print_model_summary(backbones)
+    
+    # Collect Datasets
+    datasets = {}
+    if args.data_dir: datasets[args.dataset_name] = args.data_dir
+    if args.cub200_dir: datasets['CUB200'] = args.cub200_dir
+    if args.miniimagenet_dir: datasets['miniImageNet'] = args.miniimagenet_dir
+    if args.sun397_dir: datasets['SUN397'] = args.sun397_dir
+    
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    for name, d_dir in datasets.items():
+        if args.output_csv and len(datasets) == 1:
+            out_path = args.output_csv
+        else:
+            out_path = str(output_dir / f"submission_{name.lower()}.csv")
+            
+        evaluate_dataset(
+            backbones, device, d_dir, name, args.k_values,
+            args.batch_size, 4, args.img_size, out_path,
+            adanpc_threshold=args.adanpc_thresh,
+            lp_type=args.lp_type,
+            lp_Cs=args.lp_Cs,
+            lp_max_iter=args.lp_max_iter,
+        )
+
+if __name__ == "__main__":
+    main()
