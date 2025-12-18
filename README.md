@@ -1,7 +1,9 @@
 # dl_fall_2025_lets_do_this
 
 The project investigates the efficacy of various Self-Supervised Learning (SSL) frameworks under strict computational constraints, including a 100M parameter limit, $96\times96$ input resolution, and random initialization. We systematically evaluated contrastive (MoCo v2/v3), invariance-based (EMP-SSL), and regularization-based (VICReg, Barlow Twins) methods. To address significant distribution mismatches identified through exploratory data analysis most notably the edge density gap in fine-grained tasks, we strategically expanded the training corpus from 500K to 1.7M images using curated datasets like OpenImages V7, Places 365, and iNaturalist. Our final approach transitioned from generalist models to an ensemble of specialized ConvNeXtV2-Tiny with Barlow Twins and Vision Transformer -Tiny with MoCo v3. By shifting from k-NN evaluation to optimized linear probing, we achieved a significant $\sim15\%$ performance increase across all benchmarks, ultimately reaching private dataset accuracy of 39.12\% on CUB200, 74.34\% on MiniImageNet and 46.33\% on SUN397 on scene understanding. 
+
 The checkpoints for our best models (pretrained during the competition and after the competition) can be found 
-https://drive.google.com/drive/folders/1bal5xLJM3U5cUwNQzEsZMuqjy0O3deE5?usp=drive_link}{here}. 
+https://drive.google.com/drive/folders/1bal5xLJM3U5cUwNQzEsZMuqjy0O3deE5?usp=drive_link
+
 The code is available 
-https://github.com/VijayHarkare21/dl_fall_2025_lets_do_this.git}{here}
+https://github.com/VijayHarkare21/dl_fall_2025_lets_do_this.git
